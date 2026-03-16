@@ -1,0 +1,46 @@
+# Neural Video Codec — Base Configuration
+
+data:
+  dataset: "uvg"
+  sequences: ["Beauty", "Bosphorus", "HoneyBee"]
+  frame_dir: "data/frames"
+  patch_size: 256
+  num_workers: 4
+
+training:
+  batch_size: 8
+  epochs: 200
+  lr: 1.0e-4
+  lr_min: 1.0e-6
+  grad_clip: 1.0
+  mixed_precision: true
+  lambda_values: [0.0018, 0.0035, 0.0067, 0.013, 0.025]
+  seed: 42
+
+model:
+  # Intra-frame codec
+  intra:
+    channels: 128        # Latent channels
+    num_res_blocks: 3    # Residual blocks per stage
+    hyper_channels: 128  # Hyperprior channels
+
+  # Inter-frame codec
+  inter:
+    flow_channels: 32
+    motion_channels: 64
+    residual_channels: 64
+
+  # Entropy model
+  entropy:
+    num_scales: 64
+    scale_min: 0.11
+    scale_max: 256.0
+
+evaluation:
+  codecs: ["h264", "h265", "av1"]
+  qp_values: [15, 19, 23, 27, 31, 35, 39]
+  vmaf_model: "vmaf_v0.6.1"
+
+wandb:
+  project: "neural-video-codec"
+  entity: null

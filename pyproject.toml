@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neural-video-codec"
+version = "0.1.0"
+description = "End-to-end learned video compression with hyperprior entropy model"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "compressai>=1.2",
+    "torchmetrics>=1.0",
+    "ffmpeg-python>=0.2",
+    "wandb>=0.15",
+    "opencv-python-headless>=4.8",
+    "lpips>=0.1",
+    "pyyaml>=6.0",
+    "scipy>=1.10",
+    "matplotlib>=3.7",
+]
+
+[project.scripts]
+prepare-data = "data.prepare_dataset:main"
+train = "train:main"
+evaluate = "evaluate:main"
