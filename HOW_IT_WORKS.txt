@@ -1,0 +1,502 @@
+================================================================================
+          NEURAL VIDEO CODEC — HOW IT WORKS (A COMPLETE WALKTHROUGH)
+================================================================================
+
+
+1. THE BIG PICTURE
+================================================================================
+
+This project replaces traditional video codecs (H.264, H.265, AV1) with a
+neural network that learns to compress video. Instead of hand-designed
+transform coding (DCT, block matching, etc.), every component — the
+transform, the quantizer, the entropy coder — is a neural network trained
+end-to-end via gradient descent.
+
+The goal: achieve the same visual quality as H.264/H.265 at lower bitrates,
+or better quality at the same bitrate. We measure this with rate-distortion
+(RD) curves and BD-Rate savings.
+
+The system has two modes:
+  - INTRA-FRAME (I-frame): compress a single image from scratch
+  - INTER-FRAME (P-frame): compress a frame by referencing the previous one
+
+A video is split into Groups of Pictures (GOPs). The first frame of each GOP
+is an I-frame. All subsequent frames are P-frames that exploit temporal
+redundancy.
+
+
+2. INTRA-FRAME CODEC (Image Compression)
+================================================================================
+
+This is the foundation. It compresses a single image independently, following
+the architecture from Ballé et al. 2018 ("Variational Image Compression with
+a Scale Hyperprior").
+
+The pipeline:
+
+    Input Image (256×256×3)
+         │
+         ▼
+    ┌─────────┐
+    │ ENCODER  │   4 stages of strided 5×5 convolutions (stride 2 each)
+    │          │   with GDN activation + residual blocks
+    │          │   Downsamples 16× spatially: 256×256 → 16×16
+    │          │   Expands to 128 channels
+    └────┬────┘
+         │
+         ▼
+    Latent y (16×16×128)
+         │
+         ├──────────────────────────────────┐
+         ▼                                  ▼
+    ┌──────────────┐                  ┌───────────────┐
+    │ QUANTIZATION │                  │ HYPER-ENCODER  │
+    │ (add noise   │                  │ Compresses y   │
+    │  during train│                  │ into z (8×8×   │
+    │  round during│                  │ 128) — "side   │
+    │  inference)  │                  │ information"   │
+    └──────┬───────┘                  └───────┬───────┘
+           │                                  │
+           │                                  ▼
+           │                          ┌───────────────┐
+           │                          │ENTROPY        │
+           │                          │BOTTLENECK     │
+           │                          │Quantises z,   │
+           │                          │codes it with  │
+           │                          │a learned prior│
+           │                          └───────┬───────┘
+           │                                  │
+           │                                  ▼
+           │                          ┌───────────────┐
+           │                          │ HYPER-DECODER  │
+           │                          │ Predicts mean  │
+           │                          │ and scale of a │
+           │                          │ Gaussian for   │
+           │                          │ each element   │
+           │                          │ of y           │
+           │                          └───────┬───────┘
+           │                                  │
+           │         (mean, scale) ◄──────────┘
+           │              │
+           ▼              ▼
+    ┌──────────────────────────┐
+    │ GAUSSIAN CONDITIONAL     │
+    │ Uses (mean, scale) to    │
+    │ compute likelihood of    │
+    │ each quantised y value   │
+    │ → this IS the entropy    │
+    │   coding (rate estimate) │
+    └──────────┬───────────────┘
+               │
+               ▼
+          y_hat (16×16×128)   ← quantised latent
+               │
+               ▼
+         ┌──────────┐
+         │ DECODER   │   Mirror of encoder: 4 transposed conv stages
+         │           │   with inverse GDN + residual blocks
+         │           │   Upsamples 16×: 16×16 → 256×256
+         └─────┬─────┘
+               │
+               ▼
+        Reconstructed Image (256×256×3)
+
+
+Key components explained:
+
+ENCODER (models/encoder.py)
+  - 4 strided convolution stages, each with stride=2, kernel=5×5
+  - GDN (Generalized Divisive Normalization) activation after each stage
+    — GDN is specifically designed for image compression; it normalizes
+    activations based on their neighbors, which decorrelates the signal
+    and makes it easier to compress
+  - Residual blocks (conv → LeakyReLU → conv + skip connection) after the
+    first two stages add representational capacity
+  - Takes 3-channel RGB → produces 128-channel latent at 1/16 resolution
+
+DECODER (models/decoder.py)
+  - Exact mirror: ConvTranspose2d with stride=2 upsamples back
+  - Uses inverse GDN (IGDN) which undoes the normalization
+  - Residual blocks in the same positions as the encoder
+  - 128-channel latent → 3-channel RGB output
+
+GDN ACTIVATION
+  - Normal activations like ReLU don't account for statistical dependencies
+    between channels. GDN divides each channel by a weighted sum of its
+    neighbors' squared activations. This is a form of local gain control
+    that mimics how the human visual system processes signals, and it
+    produces outputs whose elements are more statistically independent
+    — exactly what you want before entropy coding.
+
+HYPERPRIOR (models/entropy_model.py)
+  - The key insight from Ballé 2018: to efficiently entropy-code the latent
+    y, you need to know its distribution. But the distribution varies
+    spatially (smooth regions have smaller values, edges have larger ones).
+  - Solution: compress y twice. First, a small "hyper-encoder" produces
+    z (even more compressed). z is entropy-coded with a simple learned
+    prior (the EntropyBottleneck). Then z is decoded to predict the
+    mean and scale of a Gaussian distribution for each element of y.
+  - This means the bitstream has two parts:
+      1. z (side information) — small, ~5-10% of total bits
+      2. y (main latent) — bulk of the bits, coded efficiently because
+         the decoder knows each element's distribution from z
+
+QUANTIZATION TRICK
+  - You can't backpropagate through rounding (it has zero gradient everywhere).
+  - During training: add uniform noise U(-0.5, 0.5) instead of rounding.
+    This approximates quantization and has well-defined gradients.
+  - During inference: actually round to integers and use arithmetic coding
+    to produce a real compressed bitstream.
+
+
+3. INTER-FRAME CODEC (Video Compression)
+================================================================================
+
+For P-frames, we exploit the fact that consecutive video frames are similar.
+Instead of compressing the full frame, we:
+  1. Estimate how pixels moved between frames (optical flow)
+  2. Warp the previous frame to predict the current one
+  3. Only compress the small residual (prediction error)
+
+The pipeline:
+
+    Reference Frame (previous)     Target Frame (current)
+         │                              │
+         └──────────┬───────────────────┘
+                    ▼
+           ┌─────────────────┐
+           │   SPYNET         │   Coarse-to-fine optical flow
+           │   (motion.py)    │   estimation using image pyramids
+           └────────┬────────┘
+                    │
+                    ▼
+              Optical Flow (H×W×2)   ← dx, dy per pixel
+                    │
+         ┌──────────┴──────────┐
+         ▼                     ▼
+    ┌──────────┐         ┌───────────────┐
+    │ WARP     │         │ MOTION CODEC  │
+    │ ref frame│         │ Compress the  │
+    │ using    │         │ flow field    │
+    │ flow     │         │ (encoder →    │
+    └────┬─────┘         │  entropy →    │
+         │               │  decoder)     │
+         │               └───────┬───────┘
+         │                       │
+         │              Decoded Flow (lossy)
+         │                       │
+         │                       ▼
+         │               ┌──────────┐
+         │               │ RE-WARP  │  Warp ref with DECODED flow
+         │               │ ref frame│  (ensures encoder/decoder consistency)
+         │               └────┬─────┘
+         │                    │
+         │                    ▼
+         │              Prediction
+         │                    │
+         │    Target ────────-┤
+         │                    ▼
+         │              Residual = Target - Prediction
+         │                    │
+         │                    ▼
+         │            ┌───────────────┐
+         │            │ RESIDUAL CODEC│
+         │            │ Compress the  │
+         │            │ residual      │
+         │            │ (same hyper-  │
+         │            │ prior arch)   │
+         │            └───────┬───────┘
+         │                    │
+         │              Decoded Residual
+         │                    │
+         │                    ▼
+         │         Reconstruction = Prediction + Decoded Residual
+         │
+         ▼
+    Total bits = motion bits + residual bits
+
+
+SPYNET OPTICAL FLOW (models/motion.py)
+  - SpyNet (Spatial Pyramid Network, Ranjan & Black 2017) estimates how
+    each pixel moved between two frames.
+  - It works coarse-to-fine across 4 pyramid levels:
+      Level 3 (coarsest): 32×32 images → estimate rough flow
+      Level 2: 64×64 → upscale flow from level 3, refine it
+      Level 1: 128×128 → refine further
+      Level 0: 256×256 → final fine flow
+  - At each level, a small CNN (5 conv layers with 7×7 kernels) takes:
+      [reference, target, warped_reference, current_flow] → flow_update
+  - The flow residual is added to the current flow estimate.
+  - Output: a 2-channel tensor (dx, dy) saying where each pixel came from
+    in the reference frame.
+
+WARP FUNCTION
+  - Given flow (dx, dy) at each pixel, we sample the reference frame at
+    position (x + dx, y + dy) using bilinear interpolation.
+  - This produces a "motion-compensated prediction" — what the current
+    frame would look like if nothing changed except pixel positions.
+  - PyTorch's grid_sample handles the bilinear interpolation on GPU.
+
+MOTION COMPENSATION MODULE
+  - After warping, a small 3-layer CNN refines the prediction to handle
+    things optical flow can't capture (occlusions, lighting changes,
+    non-rigid deformation).
+  - Input: concatenation of [warped_ref, target] (6 channels)
+  - Output: a correction added to the warped reference
+
+WHY COMPRESS THE FLOW?
+  - The optical flow field is also data that the decoder needs. So it
+    must be transmitted as part of the bitstream.
+  - We compress it using the same encoder→entropy→decoder architecture
+    as the main image codec, but operating on 2-channel flow instead
+    of 3-channel RGB.
+  - The decoder reconstructs a lossy version of the flow, uses THAT to
+    warp the reference (not the original flow), ensuring consistency.
+
+THE RESIDUAL
+  - After motion compensation, the prediction is close but not perfect.
+  - The residual = target - prediction captures what's left (usually
+    small values, easy to compress).
+  - We compress this residual with another hyperprior codec.
+
+
+4. THE RATE-DISTORTION LOSS (losses/rd_loss.py)
+================================================================================
+
+The entire system is trained end-to-end with a single loss:
+
+    L = R + λ · D
+
+Where:
+  R = Rate (how many bits the compressed representation costs)
+  D = Distortion (how different the reconstruction is from the original)
+  λ = Tradeoff weight (higher λ = better quality, more bits)
+
+RATE (R):
+  - During training, we don't actually do arithmetic coding. Instead, we
+    estimate the rate from the learned probability model.
+  - For each element of y and z, the entropy model outputs a likelihood
+    (probability). The information content is -log2(probability) bits.
+  - Total rate = sum of -log2(likelihood) over all elements, divided by
+    the number of pixels. This gives bits per pixel (bpp).
+  - Lower bpp = smaller file = more compression.
+
+DISTORTION (D):
+  Three options:
+  - MSE: Mean squared error. Simple, differentiable, optimizes PSNR.
+    Scaled by 255² so the loss magnitude is compatible with bpp units.
+  - MS-SSIM: Multi-scale structural similarity. Better correlates with
+    human perception than MSE. We minimize (1 - MS-SSIM).
+  - LPIPS: Learned Perceptual Image Patch Similarity. Uses a VGG network
+    to compare deep features. Best perceptual quality but slower.
+
+LAMBDA (λ):
+  - Controls the rate-quality tradeoff.
+  - Small λ (e.g., 0.0018): the model prioritizes low bitrate, quality
+    suffers — good for bandwidth-constrained scenarios.
+  - Large λ (e.g., 0.025): the model prioritizes quality, uses more bits
+    — good for archival or high-quality streaming.
+  - We train 5 separate models with different λ values to trace out the
+    full RD curve. Each model is a different operating point.
+
+
+5. TRAINING PROCESS (train.py)
+================================================================================
+
+DATASET:
+  - UVG (Ultra Video Group) dataset: standard benchmark sequences at
+    1920×1080 resolution, 120fps.
+  - Three sequences used: Beauty (face), Bosphorus (water/landscape),
+    HoneyBee (macro/nature).
+  - Frames extracted as PNG using ffmpeg.
+  - During training, 256×256 random crops are taken from each frame
+    (with random horizontal flips for augmentation).
+  - 90/10 train/validation split.
+
+TRAINING LOOP:
+  1. Sample a batch of 8 random crops
+  2. Forward pass: encode → quantize (add noise) → decode
+  3. Compute RD loss: R + λ·D
+  4. Backpropagate gradients through the entire pipeline
+  5. Clip gradients to max norm 1.0 (prevents exploding gradients)
+  6. Adam optimizer step with learning rate 1e-4
+  7. Cosine LR decay over the full training run
+
+  Repeat for 200 epochs. Save best checkpoint (lowest validation loss)
+  and periodic checkpoints every 50 epochs.
+
+MIXED PRECISION:
+  - On CUDA GPUs, uses torch.cuda.amp for float16 computation where safe.
+  - Roughly 2× speedup with minimal quality impact.
+  - Disabled on MPS (Apple Silicon) and CPU.
+
+MULTI-RATE TRAINING:
+  - To get a full RD curve, train 5 independent models:
+      λ = 0.0018 (lowest quality, lowest bitrate)
+      λ = 0.0035
+      λ = 0.0067
+      λ = 0.013
+      λ = 0.025  (highest quality, highest bitrate)
+  - Each model learns to optimize for its specific rate-quality point.
+
+
+6. EVALUATION PIPELINE (evaluate.py)
+================================================================================
+
+The evaluation answers: "Is our learned codec better than H.264/H.265/AV1?"
+
+LEARNED CODEC EVALUATION:
+  1. Load a trained checkpoint
+  2. For each frame in the test sequence:
+     - Pad to a multiple of 64 (required by the 16× downsampling)
+     - Forward pass through the model
+     - Compute bpp from likelihoods
+     - Compute PSNR and MS-SSIM vs. original
+  3. Average metrics across all frames
+
+CLASSICAL CODEC EVALUATION:
+  1. For each codec (H.264, H.265, AV1) and each QP value:
+     - Encode the frame sequence using ffmpeg
+     - Measure the output file size → compute bpp
+     - Decode back to frames
+     - Compute PSNR and MS-SSIM of decoded vs. original
+  2. This gives multiple (bpp, PSNR) points per codec
+
+METRICS:
+  - PSNR (Peak Signal-to-Noise Ratio): 10·log10(255²/MSE). Higher is
+    better. 30dB = noticeable artifacts, 40dB = nearly transparent.
+  - MS-SSIM: Structural similarity at multiple scales. Range [0, 1],
+    higher is better. Better correlates with human perception than PSNR.
+  - VMAF (Video Multi-Method Assessment Fusion): Netflix's perceptual
+    quality metric. Range [0, 100]. Computed via ffmpeg's libvmaf filter.
+  - BD-Rate (Bjontegaard Delta Rate): the percentage bitrate savings of
+    one codec vs. another at the same quality. -10% BD-Rate means our
+    codec uses 10% fewer bits for the same PSNR. Computed by integrating
+    the area between two RD curves.
+
+
+7. VISUALIZATION (visualize.py)
+================================================================================
+
+Generates two types of plots:
+
+RD CURVES:
+  - X-axis: bitrate in bpp (bits per pixel)
+  - Y-axis: PSNR (dB) or MS-SSIM
+  - One line per codec (H.264 red, H.265 blue, AV1 green, Ours red star)
+  - A codec is better if its curve is higher and to the left
+    (more quality per bit)
+
+VISUAL COMPARISONS:
+  - Side-by-side images at similar bitrates
+  - Shows where the learned codec preserves detail vs. where classical
+    codecs introduce blocking artifacts
+
+
+8. FILE-BY-FILE REFERENCE
+================================================================================
+
+configs/base.yaml
+  All hyperparameters in one place: patch size, learning rate, λ values,
+  model channel counts, evaluation QP values, wandb config.
+
+data/prepare_dataset.py
+  Downloads UVG sequences (raw YUV) and extracts PNG frames via ffmpeg.
+  Has a --dummy mode that generates small synthetic images for testing
+  without needing to download the ~7GB UVG dataset.
+
+models/encoder.py
+  - ResidualBlock: skip-connection block with two 3×3 convolutions
+  - Encoder: 4-stage strided CNN (16× downsample), GDN activations
+  - HyperEncoder: 2-stage CNN to compress the latent into side info
+
+models/decoder.py
+  - Decoder: mirror of Encoder with ConvTranspose2d and inverse GDN
+  - HyperDecoder: mirror of HyperEncoder, outputs 2×channels for
+    (mean, scale) prediction
+
+models/entropy_model.py
+  - HyperpriorEntropy: full hyperprior pipeline
+    - forward(): training mode (noise injection, likelihood computation)
+    - compress(): actual bitstream encoding for deployment
+    - decompress(): bitstream decoding
+  - Uses CompressAI's EntropyBottleneck (for z) and GaussianConditional
+    (for y)
+
+models/motion.py
+  - SpyNetUnit: single pyramid level CNN (5 conv layers, 7×7 kernels)
+  - SpyNet: coarse-to-fine optical flow with 4 pyramid levels
+  - warp(): bilinear backward warping using grid_sample
+  - MotionCompensation: flow estimation + warping + refinement CNN
+
+models/codec.py
+  - IntraFrameCodec: encoder + entropy model + decoder for I-frames
+  - InterFrameCodec: motion estimation + motion codec + residual codec
+  - VideoCodec: ties I-frame and P-frame codecs together with GOP logic
+
+losses/rd_loss.py
+  - RateDistortionLoss: computes L = R + λ·D
+  - Rate from likelihoods, distortion from MSE/MS-SSIM/LPIPS
+
+train.py
+  - FrameDataset: loads PNG frames, random crops, augmentation
+  - Training loop with Adam, cosine LR, gradient clipping, mixed precision
+  - Wandb logging, best/periodic checkpointing
+
+evaluate.py
+  - Classical codec benchmarking via ffmpeg subprocess calls
+  - Learned codec evaluation with padding and metric computation
+  - BD-Rate calculation using cubic spline interpolation
+
+visualize.py
+  - RD curve plotting (PSNR and MS-SSIM variants)
+  - Side-by-side visual quality comparison
+
+
+9. HOW CLASSICAL CODECS WORK (FOR COMPARISON)
+================================================================================
+
+H.264, H.265, and AV1 all follow the same basic structure, but with
+hand-designed components instead of learned ones:
+
+  Classical:                      Ours (learned):
+  ─────────                       ────────────────
+  Block-based DCT transform   →   CNN encoder (learned transform)
+  Scalar quantization tables  →   Uniform noise / rounding
+  Context-adaptive arithmetic →   Hyperprior Gaussian conditional
+    coding (CABAC)                   + entropy bottleneck
+  Block matching for motion   →   SpyNet optical flow
+  Integer-pel + fractional    →   Bilinear warp + refinement CNN
+    motion compensation
+  Hand-tuned RDO              →   End-to-end gradient descent
+
+The advantage of the learned approach: every component is jointly
+optimized for the final RD objective. Classical codecs optimize each
+component separately, which leaves performance on the table.
+
+The disadvantage: neural codecs are computationally heavier (GPU needed)
+and haven't had 30 years of engineering optimization.
+
+
+10. RUNNING THE PROJECT
+================================================================================
+
+Quick test (no real data needed):
+  conda activate neural-video-codec
+  cd neural-video-codec
+  python train.py --lmbda 0.013 --epochs 5 --dummy --no-wandb
+
+Full training:
+  python data/prepare_dataset.py                        # download UVG
+  for lmbda in 0.0018 0.0035 0.0067 0.013 0.025; do
+      python train.py --lmbda $lmbda --epochs 200
+  done
+
+Evaluation:
+  python evaluate.py --checkpoint checkpoints/intra_lmbda0.013/best.pt
+
+Plotting:
+  python visualize.py --results results/results_Beauty.json
+
+
+================================================================================
